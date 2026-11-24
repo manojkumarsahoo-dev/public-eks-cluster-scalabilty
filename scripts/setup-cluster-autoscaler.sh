@@ -14,6 +14,32 @@ sed -i "s|registry.k8s.io/autoscaling/cluster-autoscaler:v[0-9.]*|registry.k8s.i
 kubectl apply -f /tmp/cluster-autoscaler.yaml
 kubectl -n kube-system annotate deployment.apps/cluster-autoscaler \
   cluster-autoscaler.kubernetes.io/safe-to-evict="false" --overwrite
+# Kubernetes 1.35 Cluster Autoscaler also watches DRA resources; the example manifest's
+# RBAC does not allow it, which floods the logs with "forbidden" errors. Grant read access.
+kubectl apply -f - <<'RBAC'
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: cluster-autoscaler-dra
+rules:
+  - apiGroups: ["resource.k8s.io"]
+    resources: ["resourceclaims", "resourceslices", "deviceclasses"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: cluster-autoscaler-dra
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cluster-autoscaler-dra
+subjects:
+  - kind: ServiceAccount
+    name: cluster-autoscaler
+    namespace: kube-system
+RBAC
+
 # Tell Cluster Autoscaler the region explicitly (avoids region lookup problems)
 kubectl -n kube-system set env deployment/cluster-autoscaler AWS_REGION="${AWS_REGION:-us-east-1}"
 

@@ -162,6 +162,7 @@ The nodes and the EKS control plane are billed hourly while they exist (roughly 
 | HPA TARGETS `<unknown>` | metrics-server not ready; wait 2 minutes and run `status` |
 | Pods Pending but nodes do not increase | Already at 6 nodes, or the cluster-autoscaler pod is not Running; check `status` logs |
 | Autoscaler log `an AWS region is required` or credentials errors | The pod cannot use the node's metadata service. Workflow 02 gives it permissions through EKS Pod Identity (IAM role `manoj-cluster-autoscaler-role`); re-run workflow 02 |
+| Autoscaler logs full of `resourceslices ... forbidden` (resource.k8s.io) | Missing read permission for DRA resources. Fixed by `scripts/setup-cluster-autoscaler.sh` (adds ClusterRole `cluster-autoscaler-dra`); re-run workflow 02 |
 | Autoscaler logs show AccessDenied | `autoScaler: true` missing in `infra/cluster.yaml` or the node group was created without it |
 | Nodes do not scale down | Wait the full 10-15 minutes after `node-test-stop` and `hpa-load-stop` |
 | Workflow 04 skipped | The confirm input must be exactly `manoj` |
