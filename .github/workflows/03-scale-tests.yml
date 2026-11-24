@@ -1,0 +1,63 @@
+name: 03 - Scaling tests (HPA and node scaling)
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "What to run"
+        required: true
+        type: choice
+        options:
+          - status
+          - hpa-load-start
+          - hpa-load-stop
+          - node-test-start
+          - node-test-stop
+
+env:
+  AWS_REGION: us-east-1
+  CLUSTER_NAME: manoj
+
+concurrency:
+  group: eks-lab-tests
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Connect kubectl to the cluster
+        run: aws eks update-kubeconfig --region "$AWS_REGION" --name "$CLUSTER_NAME"
+
+      - name: Run action
+        run: |
+          case "${{ inputs.action }}" in
+            hpa-load-start)  kubectl apply  -f k8s/load-generator.yaml ;;
+            hpa-load-stop)   kubectl delete -f k8s/load-generator.yaml --ignore-not-found ;;
+            node-test-start) kubectl apply  -f k8s/node-scale-test.yaml ;;
+            node-test-stop)  kubectl delete -f k8s/node-scale-test.yaml --ignore-not-found ;;
+            status)          echo "Showing status only" ;;
+          esac
+
+      - name: Show current state
+        run: |
+          sleep 45
+          echo "=== NODES ===";  kubectl get nodes
+          echo "=== HPA ===";    kubectl get hpa nginx
+          echo "=== NGINX PODS ==="; kubectl get pods -l app=nginx
+          echo "=== NODE-SCALE-TEST PODS (Pending count) ==="
+          kubectl get pods -l app=node-scale-test --no-headers 2>/dev/null | awk '{c[$3]++} END {for (s in c) print s, c[s]}'
+          echo "=== CLUSTER AUTOSCALER (last 20 lines) ==="
+          kubectl -n kube-system get pods -l app=cluster-autoscaler
+          kubectl -n kube-system logs -l app=cluster-autoscaler --tail=30 || true
+          echo "--- previous (crashed) container, if any ---"
+          kubectl -n kube-system logs -l app=cluster-autoscaler --previous --tail=30 || true

@@ -1,0 +1,57 @@
+name: 04 - Destroy EKS cluster
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: "Type the cluster name (manoj) to confirm deletion"
+        required: true
+
+env:
+  AWS_REGION: us-east-1
+  CLUSTER_NAME: manoj
+
+concurrency:
+  group: eks-lab
+  cancel-in-progress: false
+
+jobs:
+  destroy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    if: ${{ inputs.confirm == 'manoj' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Install eksctl
+        run: |
+          curl -fsSL "https://github.com/eksctl-io/eksctl/releases/latest/download/eksctl_Linux_amd64.tar.gz" | tar xz -C /tmp
+          sudo mv /tmp/eksctl /usr/local/bin/eksctl
+
+      - name: Delete workloads first
+        continue-on-error: true
+        run: |
+          aws eks update-kubeconfig --region "$AWS_REGION" --name "$CLUSTER_NAME"
+          kubectl delete -f k8s/load-generator.yaml --ignore-not-found
+          kubectl delete -f k8s/node-scale-test.yaml --ignore-not-found
+          kubectl delete -f k8s/hpa.yaml --ignore-not-found
+          kubectl delete -f k8s/nginx.yaml --ignore-not-found
+
+      - name: Delete cluster
+        run: eksctl delete cluster -f infra/cluster.yaml --wait
+
+      - name: Delete IAM role and policy created for Cluster Autoscaler
+        continue-on-error: true
+        run: |
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          ROLE_NAME="${CLUSTER_NAME}-cluster-autoscaler-role"
+          POLICY_ARN="arn:aws:iam::${ACCOUNT_ID}:policy/${CLUSTER_NAME}-cluster-autoscaler-policy"
+          aws iam detach-role-policy --role-name "$ROLE_NAME" --policy-arn "$POLICY_ARN" || true
+          aws iam delete-role --role-name "$ROLE_NAME" || true
+          aws iam delete-policy --policy-arn "$POLICY_ARN" || true

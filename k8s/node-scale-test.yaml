@@ -1,0 +1,23 @@
+# Separate workload for the node-scaling test, so it does not fight with the HPA.
+# 10 pods x 500m CPU = 5 vCPU requested -> does not fit on 2 x t3.medium -> Pending pods -> new nodes.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: node-scale-test
+spec:
+  replicas: 10
+  selector:
+    matchLabels:
+      app: node-scale-test
+  template:
+    metadata:
+      labels:
+        app: node-scale-test
+    spec:
+      containers:
+        - name: pause
+          image: registry.k8s.io/pause:3.9
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "128Mi"

@@ -1,0 +1,167 @@
+name: 02 - Deploy metrics-server, nginx, HPA, Cluster Autoscaler
+
+on:
+  workflow_dispatch:
+
+env:
+  AWS_REGION: us-east-1
+  CLUSTER_NAME: manoj
+  CA_VERSION: "1.35.2"
+
+concurrency:
+  group: eks-lab
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Connect kubectl to the cluster
+        run: aws eks update-kubeconfig --region "$AWS_REGION" --name "$CLUSTER_NAME"
+
+      - name: Ensure metrics-server works (install, or auto-repair if broken)
+        run: |
+          URL=https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
+
+          wait_for_metrics() {
+            for i in $(seq 1 "$1"); do
+              if kubectl top nodes >/dev/null 2>&1; then return 0; fi
+              echo "Metrics API not ready yet, waiting 10s..."
+              sleep 10
+            done
+            return 1
+          }
+
+          # 1. Install only if the cluster does not already have metrics-server
+          if kubectl -n kube-system get deployment metrics-server >/dev/null 2>&1; then
+            echo "metrics-server already present, not re-applying."
+          else
+            kubectl apply -f "$URL"
+          fi
+          kubectl -n kube-system rollout status deployment/metrics-server --timeout=180s
+
+          # 2. If the metrics API does not respond, repair it automatically
+          if wait_for_metrics 6; then
+            echo "Metrics API is working."
+          else
+            echo "Metrics API is not working. Repairing metrics-server..."
+            if aws eks list-addons --cluster-name "$CLUSTER_NAME" --region "$AWS_REGION" --query 'addons' --output text | grep -qw metrics-server; then
+              echo "It is an EKS managed add-on: restoring its defaults."
+              aws eks update-addon --cluster-name "$CLUSTER_NAME" --region "$AWS_REGION" \
+                --addon-name metrics-server --resolve-conflicts OVERWRITE
+              aws eks wait addon-active --cluster-name "$CLUSTER_NAME" --region "$AWS_REGION" --addon-name metrics-server
+            else
+              echo "Not a managed add-on: deleting and re-applying the upstream manifest."
+              kubectl delete -f "$URL" --ignore-not-found
+              kubectl apply -f "$URL"
+            fi
+            kubectl -n kube-system rollout status deployment/metrics-server --timeout=180s
+
+            if wait_for_metrics 24; then
+              echo "Metrics API is working after repair."
+            else
+              echo "=== Still failing. Diagnostics (send these to get help) ==="
+              kubectl -n kube-system get deploy,svc,endpoints,pods -l k8s-app=metrics-server -o wide || true
+              kubectl get apiservice v1beta1.metrics.k8s.io -o jsonpath='{range .status.conditions[*]}{.type}={.status} {.reason}: {.message}{"\n"}{end}' || true
+              kubectl -n kube-system logs deploy/metrics-server --tail=40 || true
+              exit 1
+            fi
+          fi
+          kubectl top nodes
+
+      - name: Deploy nginx and HPA
+        run: |
+          kubectl apply -f k8s/nginx.yaml
+          kubectl rollout status deployment/nginx --timeout=180s
+          kubectl apply -f k8s/hpa.yaml
+
+      - name: Give Cluster Autoscaler AWS permissions (EKS Pod Identity)
+        run: |
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          POLICY_NAME="${CLUSTER_NAME}-cluster-autoscaler-policy"
+          ROLE_NAME="${CLUSTER_NAME}-cluster-autoscaler-role"
+          POLICY_ARN="arn:aws:iam::${ACCOUNT_ID}:policy/${POLICY_NAME}"
+
+          cat > /tmp/ca-policy.json <<'JSON'
+          {
+            "Version": "2012-10-17",
+            "Statement": [
+              {
+                "Effect": "Allow",
+                "Action": [
+                  "autoscaling:DescribeAutoScalingGroups",
+                  "autoscaling:DescribeAutoScalingInstances",
+                  "autoscaling:DescribeLaunchConfigurations",
+                  "autoscaling:DescribeScalingActivities",
+                  "autoscaling:DescribeTags",
+                  "autoscaling:SetDesiredCapacity",
+                  "autoscaling:TerminateInstanceInAutoScalingGroup",
+                  "ec2:DescribeImages",
+                  "ec2:DescribeInstanceTypes",
+                  "ec2:DescribeLaunchTemplateVersions",
+                  "ec2:GetInstanceTypesFromInstanceRequirements",
+                  "eks:DescribeNodegroup"
+                ],
+                "Resource": "*"
+              }
+            ]
+          }
+          JSON
+
+          cat > /tmp/trust.json <<'JSON'
+          {
+            "Version": "2012-10-17",
+            "Statement": [
+              {
+                "Effect": "Allow",
+                "Principal": { "Service": "pods.eks.amazonaws.com" },
+                "Action": ["sts:AssumeRole", "sts:TagSession"]
+              }
+            ]
+          }
+          JSON
+
+          if ! aws iam get-policy --policy-arn "$POLICY_ARN" >/dev/null 2>&1; then
+            aws iam create-policy --policy-name "$POLICY_NAME" --policy-document file:///tmp/ca-policy.json
+          fi
+          if ! aws iam get-role --role-name "$ROLE_NAME" >/dev/null 2>&1; then
+            aws iam create-role --role-name "$ROLE_NAME" --assume-role-policy-document file:///tmp/trust.json
+            sleep 10
+          fi
+          aws iam attach-role-policy --role-name "$ROLE_NAME" --policy-arn "$POLICY_ARN"
+
+          if ! aws eks describe-addon --cluster-name "$CLUSTER_NAME" --addon-name eks-pod-identity-agent >/dev/null 2>&1; then
+            aws eks create-addon --cluster-name "$CLUSTER_NAME" --addon-name eks-pod-identity-agent
+          fi
+          aws eks wait addon-active --cluster-name "$CLUSTER_NAME" --addon-name eks-pod-identity-agent
+
+          ROLE_ARN=$(aws iam get-role --role-name "$ROLE_NAME" --query Role.Arn --output text)
+          ASSOC=$(aws eks list-pod-identity-associations --cluster-name "$CLUSTER_NAME" \
+            --namespace kube-system --service-account cluster-autoscaler \
+            --query 'associations[0].associationId' --output text)
+          if [ -z "$ASSOC" ] || [ "$ASSOC" = "None" ]; then
+            aws eks create-pod-identity-association --cluster-name "$CLUSTER_NAME" \
+              --namespace kube-system --service-account cluster-autoscaler --role-arn "$ROLE_ARN"
+          else
+            echo "Pod Identity association already exists: $ASSOC"
+          fi
+
+      - name: Install Cluster Autoscaler
+        run: |
+          chmod +x scripts/setup-cluster-autoscaler.sh
+          ./scripts/setup-cluster-autoscaler.sh
+
+      - name: Show state
+        run: |
+          kubectl get nodes
+          kubectl get pods -A
+          kubectl get hpa
